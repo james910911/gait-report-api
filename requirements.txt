@@ -1,7 +1,1 @@
-flask
-flask-cors
-nbformat
-nbclient
-reportlab
-pandas
-numpy
+
