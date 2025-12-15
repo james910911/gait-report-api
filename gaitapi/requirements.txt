@@ -6,3 +6,6 @@ reportlab
 pandas
 numpy
 gunicorn
+ipykernel
+jupyter-client
+jupyter-core
