@@ -5,3 +5,4 @@ nbclient
 reportlab
 pandas
 numpy
+gunicorn
