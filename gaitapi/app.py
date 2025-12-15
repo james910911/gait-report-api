@@ -44,7 +44,7 @@ def run_notebook_with_json(json_path: str, base_name: str) -> str:
     os.environ["OUTPUT_DIR"] = REPORT_DIR
 
     # 執行 notebook
-    client = NotebookClient(nb, timeout=900, kernel_name="python3")
+    client = NotebookClient(nb, timeout=900)
     client.execute()
 
     if not os.path.exists(pdf_path):
@@ -97,3 +97,4 @@ if __name__ == "__main__":
     # Render 會給 PORT，必須綁 0.0.0.0
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
