@@ -1,100 +1,50 @@
-from flask import Flask, request, jsonify, send_from_directory, url_for, make_response
-import os, re, sys, subprocess
+from flask import Flask, request, jsonify, send_from_directory, url_for
+from flask_cors import CORS
+import os
+import tempfile
 import nbformat
 from nbclient import NotebookClient
 
+# =========================================================
+# 基本設定
+# =========================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# static 放前端：gaitapi/static/index.html
 app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "static"))
+CORS(app, resources={r"/*": {"origins": "*"}})  # 保險：就算前後端不同網域也能 call
 
+# 你的 ipynb 檔放在哪裡（相對於 gaitapi/）
 NOTEBOOK_PATH = os.path.join(BASE_DIR, "力版修正最終(加上LLRR) - 表演+衰弱辨識.ipynb")
 
+# PDF 輸出資料夾（相對於 gaitapi/）
 REPORT_DIR = os.path.join(BASE_DIR, "generated_reports")
 os.makedirs(REPORT_DIR, exist_ok=True)
 
-UPLOAD_DIR = os.path.join(REPORT_DIR, "_uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-
-# ====== CORS：最穩的手動版（確保連錯誤/405/500都會帶 header）======
-@app.after_request
-def add_cors_headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"  # 先全開，穩定後再收斂成你的 GitHub Pages 網域
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    resp.headers["Access-Control-Max-Age"] = "86400"
-    return resp
-
-
-def _safe_basename(filename: str) -> str:
-    name = os.path.splitext(os.path.basename(filename))[0]
-    name = re.sub(r"[^\w\u4e00-\u9fff\- ]+", "_", name)
-    name = name.strip().replace(" ", "_")
-    return name or "report"
-
-
-def ensure_python3_kernel():
-    try:
-        from jupyter_client.kernelspec import KernelSpecManager
-        ksm = KernelSpecManager()
-        specs = ksm.find_kernel_specs()
-        if "python3" in specs:
-            return
-        subprocess.check_call([
-            sys.executable, "-m", "ipykernel", "install",
-            "--user", "--name", "python3", "--display-name", "Python 3"
-        ])
-    except Exception as e:
-        print("⚠️ ensure_python3_kernel failed:", repr(e))
-
-
-def sanitize_notebook_for_server(nb):
-    for cell in nb.cells:
-        if cell.get("cell_type") != "code":
-            continue
-        src = cell.get("source", "") or ""
-        if not src:
-            continue
-
-        lines = src.splitlines()
-        new_lines = []
-        inserted_agg = False
-
-        for line in lines:
-            stripped = line.strip()
-
-            if stripped.startswith("%matplotlib"):
-                if not inserted_agg:
-                    new_lines.append("import matplotlib")
-                    new_lines.append("matplotlib.use('Agg')  # server/headless")
-                    inserted_agg = True
-                continue
-
-            if stripped.startswith("%") or stripped.startswith("!"):
-                continue
-
-            new_lines.append(line)
-
-        cell["source"] = "\n".join(new_lines)
-    return nb
+@app.route("/")
+def index():
+    # 會回傳 gaitapi/static/index.html
+    return app.send_static_file("index.html")
 
 
 def run_notebook_with_json(json_path: str, base_name: str) -> str:
+    """執行 ipynb 並生成 PDF，回傳 pdf 檔名"""
     if not os.path.exists(NOTEBOOK_PATH):
-        raise RuntimeError(f"❗找不到 Notebook：{NOTEBOOK_PATH}")
+        raise FileNotFoundError(f"找不到 Notebook：{NOTEBOOK_PATH}")
 
     nb = nbformat.read(NOTEBOOK_PATH, as_version=4)
-    nb = sanitize_notebook_for_server(nb)
 
-    pdf_filename = f"{base_name}.pdf"
+    pdf_filename = f"{base_name}_gait_report.pdf"
     pdf_path = os.path.join(REPORT_DIR, pdf_filename)
 
-    exec_env = os.environ.copy()
-    exec_env["INPUT_JSON"] = json_path
-    exec_env["OUTPUT_DIR"] = REPORT_DIR
-    exec_env["RESULT_PDF"] = pdf_path
+    # 注入給 notebook 用的環境變數（你 notebook 內要用 os.environ.get 讀）
+    os.environ["INPUT_JSON"] = json_path
+    os.environ["RESULT_PDF"] = pdf_path
+    os.environ["OUTPUT_DIR"] = REPORT_DIR
 
-    client = NotebookClient(nb, timeout=900, env=exec_env)  # 不指定 kernel_name，避免 kernelspec 問題
+    # 執行 notebook
+    client = NotebookClient(nb, timeout=900, kernel_name="python3")
     client.execute()
 
     if not os.path.exists(pdf_path):
@@ -103,53 +53,47 @@ def run_notebook_with_json(json_path: str, base_name: str) -> str:
     return pdf_filename
 
 
-@app.get("/")
-def health():
-    static_index = os.path.join(app.static_folder, "index.html")
-    if os.path.exists(static_index):
-        return app.send_static_file("index.html")
-    return "OK: gait-report-api is running", 200
-
-
-# ✅ 這裡要明確支援 OPTIONS（CORS preflight）
-@app.route("/run", methods=["POST", "OPTIONS"])
+@app.route("/run", methods=["POST"])
 def run_analysis():
-    if request.method == "OPTIONS":
-        return make_response("", 200)
-
     if "file" not in request.files:
-        return jsonify({"error": "沒有收到檔案（欄位名稱必須是 file）"}), 400
+        return jsonify({"error": "沒有收到檔案（欄位名稱要是 file）"}), 400
 
-    up = request.files["file"]
-    if not up.filename:
+    f = request.files["file"]
+    if not f or f.filename == "":
         return jsonify({"error": "檔案名稱無效"}), 400
 
-    if not up.filename.lower().endswith(".json"):
-        return jsonify({"error": "只接受 .json 檔案"}), 400
+    if not f.filename.lower().endswith(".json"):
+        return jsonify({"error": "請上傳 .json 檔"}), 400
 
-    base_name = _safe_basename(up.filename)
-    json_path = os.path.join(UPLOAD_DIR, f"{base_name}.json")
-    up.save(json_path)
+    base_name = os.path.splitext(os.path.basename(f.filename))[0]
 
+    # 存成暫存檔
+    tmp_path = None
     try:
-        pdf_filename = run_notebook_with_json(json_path, base_name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+            f.save(tmp.name)
+            tmp_path = tmp.name
+
+        pdf_filename = run_notebook_with_json(tmp_path, base_name)
+
+        # 回傳可下載 PDF 的網址（前端用 data.pdf_url 直接打開即可）
+        pdf_url = url_for("download_report", filename=pdf_filename, _external=False)
+        return jsonify({"pdf_url": pdf_url})
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
     finally:
-        if os.path.exists(json_path):
-            os.remove(json_path)
-
-    pdf_url = url_for("download_report", filename=pdf_filename, _external=True)
-    return jsonify({"pdf_url": pdf_url}), 200
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
-@app.get("/report/<path:filename>")
+@app.route("/report/<path:filename>")
 def download_report(filename):
     return send_from_directory(REPORT_DIR, filename, mimetype="application/pdf")
 
 
-ensure_python3_kernel()
-
 if __name__ == "__main__":
+    # Render 會給 PORT，必須綁 0.0.0.0
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
