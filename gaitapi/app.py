@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify, send_from_directory, url_for
 from flask_cors import CORS
-
 import os
 import re
 import sys
@@ -11,26 +10,28 @@ from nbclient import NotebookClient
 # ========== 基本設定 ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# static 放你的 index.html（可有可無）
 app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "static"))
-CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 你的 ipynb 路徑（跟 app.py 同層）
+# ✅ CORS：讓 GitHub Pages / 任何網域都能打（先全開，穩定後再收斂）
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=False,
+    allow_headers=["Content-Type"],
+    methods=["GET", "POST", "OPTIONS"],
+)
+
 NOTEBOOK_PATH = os.path.join(BASE_DIR, "力版修正最終(加上LLRR) - 表演+衰弱辨識.ipynb")
 
-# 報告輸出資料夾
 REPORT_DIR = os.path.join(BASE_DIR, "generated_reports")
 os.makedirs(REPORT_DIR, exist_ok=True)
 
-# 上傳暫存資料夾
 UPLOAD_DIR = os.path.join(REPORT_DIR, "_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 # ========== 工具函式 ==========
-
 def _safe_basename(filename: str) -> str:
-    """把上傳檔名轉成安全檔名"""
     name = os.path.splitext(os.path.basename(filename))[0]
     name = re.sub(r"[^\w\u4e00-\u9fff\- ]+", "_", name)
     name = name.strip().replace(" ", "_")
@@ -39,33 +40,29 @@ def _safe_basename(filename: str) -> str:
 
 def ensure_python3_kernel():
     """
-    Render 環境常見：有 ipykernel 但沒有 kernelspec => 會出現 No such kernel named python3
-    這裡在啟動時自動補裝 kernelspec。
+    可留著：Render 環境常見有 ipykernel 但沒 kernelspec。
+    但就算失敗也不會阻止服務啟動。
     """
     try:
         from jupyter_client.kernelspec import KernelSpecManager
         ksm = KernelSpecManager()
-        specs = ksm.find_kernel_specs()  # dict
+        specs = ksm.find_kernel_specs()
         if "python3" in specs:
             return
 
-        # 沒有 python3 kernel -> 安裝
         subprocess.check_call([
             sys.executable, "-m", "ipykernel", "install",
-            "--user",
-            "--name", "python3",
-            "--display-name", "Python 3"
+            "--user", "--name", "python3", "--display-name", "Python 3"
         ])
     except Exception as e:
-        # 就算失敗也先讓程式跑起來，之後 /run 才會報錯比較明確
         print("⚠️ ensure_python3_kernel failed:", repr(e))
 
 
 def sanitize_notebook_for_server(nb):
     """
-    伺服器環境不能用 %matplotlib widget
-    - 把 '%matplotlib widget' / '%matplotlib' 改成 Agg
-    - 移除所有以 % 或 ! 開頭的魔法指令行
+    ✅ Render/伺服器是 headless，不能用 %matplotlib widget
+    - 任何 %matplotlib... 一律改成 Agg
+    - 移除其他以 % 或 ! 開頭的魔法指令
     """
     for cell in nb.cells:
         if cell.get("cell_type") != "code":
@@ -82,7 +79,6 @@ def sanitize_notebook_for_server(nb):
         for line in lines:
             stripped = line.strip()
 
-            # 取代 matplotlib widget
             if stripped.startswith("%matplotlib"):
                 if not inserted_agg:
                     new_lines.append("import matplotlib")
@@ -90,7 +86,6 @@ def sanitize_notebook_for_server(nb):
                     inserted_agg = True
                 continue
 
-            # 移除其他魔法指令
             if stripped.startswith("%") or stripped.startswith("!"):
                 continue
 
@@ -102,7 +97,6 @@ def sanitize_notebook_for_server(nb):
 
 
 def run_notebook_with_json(json_path: str, base_name: str) -> str:
-    """執行 ipynb 並生成 PDF，回傳 pdf 檔名"""
     if not os.path.exists(NOTEBOOK_PATH):
         raise RuntimeError(f"❗找不到 Notebook：{NOTEBOOK_PATH}")
 
@@ -112,19 +106,13 @@ def run_notebook_with_json(json_path: str, base_name: str) -> str:
     pdf_filename = f"{base_name}.pdf"
     pdf_path = os.path.join(REPORT_DIR, pdf_filename)
 
-    # 每次執行都用新的 env
     exec_env = os.environ.copy()
     exec_env["INPUT_JSON"] = json_path
     exec_env["OUTPUT_DIR"] = REPORT_DIR
     exec_env["RESULT_PDF"] = pdf_path
 
-    # ✅ 這裡一定要能找到 python3 kernel
-    client = NotebookClient(
-        nb,
-        timeout=900,
-        kernel_name="python3",
-        env=exec_env
-    )
+    # ✅ 最穩：不指定 kernel_name（避免 No such kernel）
+    client = NotebookClient(nb, timeout=900, env=exec_env)
     client.execute()
 
     if not os.path.exists(pdf_path):
@@ -134,14 +122,13 @@ def run_notebook_with_json(json_path: str, base_name: str) -> str:
 
 
 # ========== Routes ==========
-
 @app.get("/")
-def index():
-    # 你想讓後端也能顯示 UI，就放 static/index.html
+def health():
+    # 你有放 static/index.html 就顯示 UI；沒有就顯示健康檢查
     static_index = os.path.join(app.static_folder, "index.html")
     if os.path.exists(static_index):
         return app.send_static_file("index.html")
-    return "OK: gait-report-api is running"
+    return "OK: gait-report-api is running", 200
 
 
 @app.post("/run")
@@ -165,12 +152,12 @@ def run_analysis():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        # 不想刪就註解掉
         if os.path.exists(json_path):
             os.remove(json_path)
 
+    # ✅ 回傳「完整網址」給前端（前端不要再拼 BACKEND_URL）
     pdf_url = url_for("download_report", filename=pdf_filename, _external=True)
-    return jsonify({"pdf_url": pdf_url})
+    return jsonify({"pdf_url": pdf_url}), 200
 
 
 @app.get("/report/<path:filename>")
