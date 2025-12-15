@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_from_directory, url_for
 from flask_cors import CORS
+
 import os
 import re
 import sys
@@ -12,7 +13,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "static"))
 
-# ✅ CORS：讓 GitHub Pages / 任何網域都能打（先全開，穩定後再收斂）
+# 先留著（可有可無），但真正保險的是下面 after_request 強制加 header
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
@@ -30,6 +31,15 @@ UPLOAD_DIR = os.path.join(REPORT_DIR, "_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+# ========== ✅ 最重要：強制所有回應都加 CORS（含 500/404） ==========
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
 # ========== 工具函式 ==========
 def _safe_basename(filename: str) -> str:
     name = os.path.splitext(os.path.basename(filename))[0]
@@ -40,8 +50,8 @@ def _safe_basename(filename: str) -> str:
 
 def ensure_python3_kernel():
     """
-    可留著：Render 環境常見有 ipykernel 但沒 kernelspec。
-    但就算失敗也不會阻止服務啟動。
+    Render 常見：有 ipykernel 但沒 kernelspec -> No such kernel named python3
+    這裡嘗試補裝 kernelspec
     """
     try:
         from jupyter_client.kernelspec import KernelSpecManager
@@ -60,9 +70,9 @@ def ensure_python3_kernel():
 
 def sanitize_notebook_for_server(nb):
     """
-    ✅ Render/伺服器是 headless，不能用 %matplotlib widget
+    伺服器 headless：不能用 %matplotlib widget
     - 任何 %matplotlib... 一律改成 Agg
-    - 移除其他以 % 或 ! 開頭的魔法指令
+    - 移除其他 % / ! 魔法指令
     """
     for cell in nb.cells:
         if cell.get("cell_type") != "code":
@@ -111,8 +121,8 @@ def run_notebook_with_json(json_path: str, base_name: str) -> str:
     exec_env["OUTPUT_DIR"] = REPORT_DIR
     exec_env["RESULT_PDF"] = pdf_path
 
-    # ✅ 最穩：不指定 kernel_name（避免 No such kernel）
-    client = NotebookClient(nb, timeout=900, env=exec_env)
+    # ✅ 建議指定 python3（搭配 ensure_python3_kernel），比較可控
+    client = NotebookClient(nb, timeout=900, kernel_name="python3", env=exec_env)
     client.execute()
 
     if not os.path.exists(pdf_path):
@@ -124,11 +134,16 @@ def run_notebook_with_json(json_path: str, base_name: str) -> str:
 # ========== Routes ==========
 @app.get("/")
 def health():
-    # 你有放 static/index.html 就顯示 UI；沒有就顯示健康檢查
     static_index = os.path.join(app.static_folder, "index.html")
     if os.path.exists(static_index):
         return app.send_static_file("index.html")
     return "OK: gait-report-api is running", 200
+
+
+# ✅ Preflight：瀏覽器會先 OPTIONS /run
+@app.route("/run", methods=["OPTIONS"])
+def run_preflight():
+    return ("", 204)
 
 
 @app.post("/run")
@@ -155,7 +170,7 @@ def run_analysis():
         if os.path.exists(json_path):
             os.remove(json_path)
 
-    # ✅ 回傳「完整網址」給前端（前端不要再拼 BACKEND_URL）
+    # ✅ 回傳完整網址（前端直接用，不要再拼 BACKEND_URL）
     pdf_url = url_for("download_report", filename=pdf_filename, _external=True)
     return jsonify({"pdf_url": pdf_url}), 200
 
